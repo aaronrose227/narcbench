@@ -4,7 +4,7 @@ Code and data for **Detecting Multi-Agent Collusion Through Multi-Agent Interpre
 
 NARCBench is a three-tier benchmark for evaluating multi-agent collusion detection under environment distribution shift. A linear deception probe is trained on committee-deliberation activations (Core) and evaluated zero-shot on structurally novel scenarios (Transfer) and steganographic signalling (Stego).
 
-**Paper**: [arXiv (coming soon)]
+**Paper**: [arXiv](https://arxiv.org/abs/2604.01151)
 
 **Data**: [HuggingFace](https://huggingface.co/datasets/aaronrose227/narcbench)
 
