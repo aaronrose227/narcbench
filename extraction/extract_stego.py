@@ -1,20 +1,25 @@
 """
-Extract hidden-state activations from LLM for NARCBench-Stego (blackjack) runs.
+Extract hidden-state activations for NARCBench-Stego (blackjack collusion).
 
 Two extraction modes:
   1. last-token (default): Last token of prompt/response at all target layers.
      Good for probe training (one vector per sample).
   2. per-token: All tokens at a few middle layers.
-     Good for analysing how representations shift across the response
-     (e.g. when the big player reads the counter's signal word).
+     Good for analyzing how representations shift across the response
+     (e.g. when the BP reads the counter's signal word).
 
 Each sample is tagged with role (colluder/honest), channel (public/thinking/private),
 phase (private/discussion/final), and hand number.
 
 Usage:
-    python extract_stego.py --runs-dir PATH
-    python extract_stego.py --runs-dir PATH --per-token --gen-only
-    python extract_stego.py --runs-dir PATH --layers 16,24,32,40,48
+    # Last-token, all 64 layers, both input+gen time
+    python extract_activations_blackjack.py --runs-dir PATH
+
+    # Per-token, middle layers, gen-time only
+    python extract_activations_blackjack.py --runs-dir PATH --per-token --gen-only
+
+    # Specific layers
+    python extract_activations_blackjack.py --runs-dir PATH --layers 16,24,32,40,48
 """
 
 import argparse
@@ -29,19 +34,19 @@ import config
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from tqdm import tqdm
 
-NUM_LAYERS = 64
+# NUM_LAYERS is auto-detected from the loaded model (model.config.num_hidden_layers).
 CHECKPOINT_EVERY = 50
 
 # Per-token layers: include early-middle through upper layers (literature says
 # 20-50% depth is the sweet spot, i.e. layers ~13-32 for a 64-layer model)
 DEFAULT_PER_TOKEN_LAYERS = [4, 8, 13, 16, 20, 24, 28, 32, 40, 48, 56]
 
-# Requires raw scenario outputs from generation/stego.py
+# Requires raw scenario outputs from generation/blackjack.py
 DEFAULT_RUNS_DIR = config.RAW_ROOT / "stego"
-DEFAULT_OUTPUT_DIR = config.ACTIVATIONS_ROOT / "qwen3_32b" / "stego"
+DEFAULT_OUTPUT_DIR = None  # derived from --model in main() if --output-dir not given
 
 
 def load_blackjack_runs(runs_dir: Path) -> list[dict]:
@@ -155,7 +160,7 @@ def load_blackjack_runs(runs_dir: Path) -> list[dict]:
     return samples
 
 
-def load_model(model_name: str):
+def load_model(model_name: str, quantise: str | None = None):
     """Load model and tokenizer."""
     print(f"Loading tokenizer: {model_name}")
     try:
@@ -165,15 +170,38 @@ def load_model(model_name: str):
             model_name, trust_remote_code=True, use_fast=False
         )
 
-    print(f"Loading model: {model_name} (device_map=auto)")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    kwargs = dict(device_map="auto", trust_remote_code=True)
+    if quantise == "8bit":
+        print(f"Loading model: {model_name} (8-bit quantisation)")
+        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    elif quantise == "4bit":
+        print(f"Loading model: {model_name} (4-bit quantisation)")
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16
+        )
+    elif "gpt-oss" in model_name.lower():
+        # GPT-OSS loads in MXFP4 native when `kernels` is installed (~12 GB total).
+        # Eager is the only attention impl available in transformers 5.5.
+        # Stego prompts stay under ~2.5 k tokens, so eager fits fine on 24 GB GPUs.
+        print(f"Loading model: {model_name} (MXFP4 native, eager attention)")
+        kwargs["torch_dtype"] = torch.bfloat16
+        kwargs["max_memory"] = {0: "22GiB", 1: "22GiB", "cpu": "64GiB"}
+    else:
+        print(f"Loading model: {model_name} (device_map=auto)")
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
     model.eval()
     print("Model loaded.")
     return model, tokenizer
+
+
+def _get_layers(model):
+    """Get the transformer layers from the model, handling different architectures."""
+    if hasattr(model.model, 'layers'):
+        return model.model.layers
+    if hasattr(model.model, 'language_model') and hasattr(model.model.language_model, 'layers'):
+        return model.model.language_model.layers
+    raise AttributeError(f"Cannot find transformer layers in {type(model).__name__}")
 
 
 class LastTokenHooks:
@@ -182,8 +210,9 @@ class LastTokenHooks:
     def __init__(self, model, target_layers: list[int]):
         self.captured = {}
         self.hooks = []
+        layers = _get_layers(model)
         for layer_idx in target_layers:
-            hook = model.model.layers[layer_idx].register_forward_hook(
+            hook = layers[layer_idx].register_forward_hook(
                 self._make_hook(layer_idx)
             )
             self.hooks.append(hook)
@@ -211,8 +240,9 @@ class AllTokenHooks:
     def __init__(self, model, target_layers: list[int]):
         self.captured = {}
         self.hooks = []
+        layers = _get_layers(model)
         for layer_idx in target_layers:
-            hook = model.model.layers[layer_idx].register_forward_hook(
+            hook = layers[layer_idx].register_forward_hook(
                 self._make_hook(layer_idx)
             )
             self.hooks.append(hook)
@@ -465,11 +495,12 @@ def save_last_token_results(activation_arrays, metadata, output_dir, suffix):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract activations from LLM for NARCBench-Stego"
+        description="Extract activations from LLM for blackjack collusion"
     )
     parser.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR,
-                        help="Path to NARCBench-Stego output directory")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+                        help="Path to blackjack output directory")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output directory (default: data/activations/<model_short>/stego)")
     parser.add_argument("--input-only", action="store_true",
                         help="Only extract input-time activations (last-token mode)")
     parser.add_argument("--gen-only", action="store_true",
@@ -481,23 +512,25 @@ def main():
                              "Default: all 64 (last-token) or middle 7 (per-token).")
     parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,
                         help="HuggingFace model ID (default: config.DEFAULT_MODEL)")
+    parser.add_argument("--quantise", type=str, default=None, choices=["4bit", "8bit"],
+                        help="Quantisation mode (default: none)")
     parser.add_argument("--channels", type=str, default=None,
                         help="Comma-separated channels to include, e.g. 'public,thinking'. Default: all.")
     parser.add_argument("--test", action="store_true",
                         help="Test mode: 5 samples only")
     args = parser.parse_args()
 
-    # Parse layers
+    if args.output_dir is None:
+        args.output_dir = config.activations_dir(config.model_short_name(args.model)) / "stego"
+
+    # Parse explicit --layers if given; otherwise defer to after model load
+    # so we can read num_hidden_layers from the model config.
     if args.layers:
-        if "-" in args.layers:
-            lo, hi = args.layers.split("-")
-            target_layers = list(range(int(lo), int(hi) + 1))
-        else:
-            target_layers = [int(x) for x in args.layers.split(",")]
+        target_layers = config.parse_layer_range(args.layers)
     elif args.per_token:
         target_layers = DEFAULT_PER_TOKEN_LAYERS
     else:
-        target_layers = list(range(NUM_LAYERS))
+        target_layers = None
 
     print("=" * 60)
     print("Activation Extraction: Blackjack Collusion")
@@ -505,7 +538,6 @@ def main():
     print(f"Runs dir:   {args.runs_dir}")
     print(f"Output dir: {args.output_dir}")
     print(f"Mode:       {'per-token' if args.per_token else 'last-token'}")
-    print(f"Layers:     {len(target_layers)} {target_layers}")
     print(f"Test mode:  {args.test}")
     print()
 
@@ -524,7 +556,15 @@ def main():
         samples = samples[:5]
         print(f"TEST MODE: Using only {len(samples)} samples")
 
-    model, tokenizer = load_model(args.model)
+    model, tokenizer = load_model(args.model, quantise=args.quantise)
+
+    # If no --layers was given (and we're not in per-token mode), default to
+    # the model's recommended probe-layer range from config.MODEL_LAYERS, or
+    # the middle 5 layers of the architecture for unlisted models.
+    if target_layers is None:
+        target_layers = config.default_layers(args.model, model.config.num_hidden_layers)
+    target_layers = [l for l in target_layers if l < model.config.num_hidden_layers]
+    print(f"Layers:     {len(target_layers)} {target_layers}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.per_token:

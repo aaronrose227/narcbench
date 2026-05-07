@@ -1,5 +1,5 @@
 """
-Extract hidden-state activations from Qwen3-32B-AWQ for NARCBench-Core.
+Extract hidden-state activations for the NARCBench-Core dataset.
 
 Extracts layers 16-55 (mid-to-late, where deception signal is strongest) at both:
   - input-time:      last token of the prompt before generation
@@ -38,7 +38,7 @@ if not hasattr(_ta, "PytorchGELUTanh"):
             return torch.nn.functional.gelu(x, approximate="tanh")
     _ta.PytorchGELUTanh = _PytorchGELUTanh
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from tqdm import tqdm
 
 CHECKPOINT_EVERY = 100
@@ -46,7 +46,7 @@ DEFAULT_LAYER_RANGE = "16-55"
 
 # Requires raw scenario outputs from generation/core.py
 DEFAULT_RUNS_DIR = config.RAW_ROOT / "core"
-DEFAULT_OUTPUT_DIR = config.ACTIVATIONS_ROOT / "qwen3_32b" / "core"
+DEFAULT_OUTPUT_DIR = None  # derived from --model in main() if --output-dir not given
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +59,7 @@ def _strip_name_prefix(msg: str) -> str:
 
 
 def load_runs(runs_dir: Path) -> list[dict]:
-    """Load all samples from NARCBench-Core run directories."""
+    """Load all samples from core/ run directories."""
     run_dirs = sorted([d for d in runs_dir.iterdir() if d.is_dir()])
     print(f"Found {len(run_dirs)} run directories in {runs_dir}")
 
@@ -107,8 +107,8 @@ def load_runs(runs_dir: Path) -> list[dict]:
                 # Identification
                 "run_id":           config["run_id"],
                 "scenario_id":      config["scenario_id"],
-                "scenario_domain":  config["scenario_domain"],
-                "scenario_title":   config["scenario_title"],
+                "scenario_domain":  config.get("scenario_domain", config.get("scenario_type", "")),
+                "scenario_title":   config.get("scenario_title", config["scenario_id"]),
                 "mode":             config["mode"],
                 # Agent / role
                 "agent_name":       agent,
@@ -152,7 +152,7 @@ def _print_distribution(samples: list[dict]):
 # Model
 # ---------------------------------------------------------------------------
 
-def load_model(model_name: str):
+def load_model(model_name: str, quantise: str | None = None):
     print(f"Loading tokenizer: {model_name}")
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -162,12 +162,25 @@ def load_model(model_name: str):
             model_name, trust_remote_code=True, use_fast=False
         )
 
-    print(f"Loading model: {model_name} (device_map=auto)")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    kwargs = dict(device_map="auto", trust_remote_code=True)
+    if quantise == "8bit":
+        print(f"Loading model: {model_name} (8-bit quantisation)")
+        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    elif quantise == "4bit":
+        print(f"Loading model: {model_name} (4-bit quantisation)")
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16
+        )
+    elif "gpt-oss" in model_name.lower():
+        # GPT-OSS dequantises MXFP4 to bf16 on load (~40 GB). Force bf16 + balanced
+        # split across the two 24 GB GPUs, with CPU spill as a safety net.
+        print(f"Loading model: {model_name} (bf16, balanced split across GPUs)")
+        kwargs["torch_dtype"] = torch.bfloat16
+        kwargs["max_memory"] = {0: "22GiB", 1: "22GiB", "cpu": "64GiB"}
+    else:
+        print(f"Loading model: {model_name} (device_map=auto)")
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
     model.eval()
     print("Model loaded.")
     return model, tokenizer
@@ -177,14 +190,26 @@ def load_model(model_name: str):
 # Activation hooks
 # ---------------------------------------------------------------------------
 
+def _get_layers(model):
+    """Get the transformer layers from the model, handling different architectures."""
+    # Standard: model.model.layers (Qwen, Llama, Gemma text-only)
+    if hasattr(model.model, 'layers'):
+        return model.model.layers
+    # Multimodal Gemma 4: model.model.language_model.layers
+    if hasattr(model.model, 'language_model') and hasattr(model.model.language_model, 'layers'):
+        return model.model.language_model.layers
+    raise AttributeError(f"Cannot find transformer layers in {type(model).__name__}")
+
+
 class ActivationHooks:
     """Capture last-token hidden state at each target layer via forward hooks."""
 
     def __init__(self, model, target_layers: list[int]):
         self.captured: dict[int, torch.Tensor] = {}
         self.hooks = []
+        layers = _get_layers(model)
         for idx in target_layers:
-            hook = model.model.layers[idx].register_forward_hook(self._make_hook(idx))
+            hook = layers[idx].register_forward_hook(self._make_hook(idx))
             self.hooks.append(hook)
 
     def _make_hook(self, idx: int):
@@ -209,6 +234,18 @@ class ActivationHooks:
 # Text builders
 # ---------------------------------------------------------------------------
 
+def _chat_kwargs(tokenizer):
+    """Return chat-template kwargs that suppress thinking traces for Qwen3.
+
+    Other tokenisers reject this kwarg, so apply only when the template
+    actually understands it.
+    """
+    name = (getattr(tokenizer, "name_or_path", "") or "").lower()
+    if "qwen3" in name:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {}
+
+
 def _build_input_text(tokenizer, sample: dict) -> str:
     """Prompt only, with generation prompt appended (input-time)."""
     messages = [
@@ -217,7 +254,7 @@ def _build_input_text(tokenizer, sample: dict) -> str:
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
-        chat_template_kwargs={"enable_thinking": False},
+        **_chat_kwargs(tokenizer),
     )
 
 
@@ -230,7 +267,7 @@ def _build_gen_text(tokenizer, sample: dict) -> str:
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False,
-        chat_template_kwargs={"enable_thinking": False},
+        **_chat_kwargs(tokenizer),
     )
 
 
@@ -281,7 +318,8 @@ def extract_activations(
                 # No response stored — fill with zeros so indices stay aligned
                 n_tokens = 0
                 for layer in target_layers:
-                    dummy = np.zeros(model.config.hidden_size, dtype=np.float32)
+                    hs = getattr(model.config, 'hidden_size', None) or model.config.text_config.hidden_size
+                    dummy = np.zeros(hs, dtype=np.float32)
                     activations[layer].append(dummy)
             else:
                 inputs = tokenizer(text, return_tensors="pt")
@@ -367,26 +405,34 @@ def save_results(activation_arrays, metadata, output_dir: Path, suffix: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract mid-layer activations from Qwen3-32B-AWQ (NARCBench-Core)"
+        description="Extract mid-layer activations for NARCBench-Core"
     )
     parser.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR,
-                        help="Path to NARCBench-Core output directory")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--layers", type=str, default=DEFAULT_LAYER_RANGE,
-                        help="Layer range to extract, e.g. '16-55' or '0-63'")
+                        help="Path to core/ output directory")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output directory (default: data/activations/<model_short>/core)")
+    parser.add_argument("--layers", type=str, default=None,
+                        help="Layer range to extract, e.g. '16-55' or '26,28,30'. "
+                             "Defaults to config.MODEL_LAYERS for known models, "
+                             "else the middle 5 layers of the architecture.")
     parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,
                         help="HuggingFace model ID (default: config.DEFAULT_MODEL)")
+    parser.add_argument("--quantise", type=str, default=None, choices=["4bit", "8bit"],
+                        help="Quantisation mode (default: none)")
     parser.add_argument("--input-only", action="store_true")
     parser.add_argument("--gen-only",   action="store_true")
     parser.add_argument("--test",       action="store_true", help="10 samples only")
     args = parser.parse_args()
 
-    # Parse layer range
-    lo, hi = args.layers.split("-")
-    target_layers = list(range(int(lo), int(hi) + 1))
+    # Derive output dir from --model if not given.
+    if args.output_dir is None:
+        args.output_dir = config.activations_dir(config.model_short_name(args.model)) / "core"
+
+    # Defer layer-range default to after model load so we can read num_hidden_layers.
+    target_layers = config.parse_layer_range(args.layers) if args.layers else None
 
     print("=" * 60)
-    print("Activation Extraction: NARCBench-Core")
+    print("Activation Extraction: Deception-50 Dataset")
     print("=" * 60)
     print(f"Runs dir:   {args.runs_dir}")
     print(f"Output dir: {args.output_dir}")
@@ -408,7 +454,13 @@ def main():
         print(f"\nTEST MODE: {len(samples)} samples only")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    model, tokenizer = load_model(args.model)
+    model, tokenizer = load_model(args.model, quantise=args.quantise)
+
+    # If no --layers was given, use config defaults (or middle 5 of the model).
+    if target_layers is None:
+        target_layers = config.default_layers(args.model, model.config.num_hidden_layers)
+    target_layers = [l for l in target_layers if l < model.config.num_hidden_layers]
+    print(f"Extracting layers: {target_layers}")
 
     # Input-time
     if not args.gen_only:

@@ -2,31 +2,51 @@
 
 Trains a deception direction on NARCBench-Core (discussion-round activations)
 and evaluates five detection methods zero-shot on NARCBench-Transfer and
-NARCBench-Stego.  Results are averaged over layers 26-30.
+NARCBench-Stego.  Results are averaged over the configured probe-layer range.
 """
 
+import argparse
+import csv
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
+from colours import TEAL_COLORS
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import torch.nn as nn
 from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
+# ── Config ───────────────────────────────────────────────────────────────
+
+OUT_DIR = config.RESULTS_ROOT / "figures"   # save directory
+OUT_STEM       = "method_comparison_multihead_4heads"    # output filename (no extension)
+REFERENCE_STEM = "method_comparison_LR_C250_liblinear_maxIters8"  # CSV stem to load reference lines from (None to disable)
+
+N_SEEDS = 10
+
+MHA_D_MODEL    = 64    # projection dimension inside attention
+MHA_NUM_HEADS  = 4     # number of attention heads
+MHA_DROPOUT    = 0.1   # dropout rate
+MHA_EPOCHS     = 200   # training epochs
+MHA_LR         = 1e-3  # learning rate
+MHA_BATCH_SIZE = 32    # groups per batch
+
 # ── Paths and constants ──────────────────────────────────────────────────
 
-DATA_DIR = config.ACTIVATIONS_ROOT / "qwen3_32b"
-CORE_DIR = DATA_DIR / "core"
-TRANSFER_DIR = DATA_DIR / "transfer"
-STEGO_DIR = DATA_DIR / "stego"
-OUT_DIR = config.RESULTS_ROOT / "figures"
-
-LAYERS = [26, 27, 28, 29, 30]
+# Set in main() from --model and --layers; see config.MODEL_LAYERS for defaults.
+DATA_DIR = None
+CORE_DIR = None
+TRANSFER_DIR = None
+STEGO_DIR = None
+LAYERS = None
 
 METHOD_KEYS = [
     "sorted_concat",
@@ -42,7 +62,7 @@ METHOD_NAMES = [
     "Deception\nSplit",
     "Asymmetry\nProbe",
 ]
-COLORS = ["#2d6a6a", "#5b9e9e", "#8fbc5e", "#e8c547", "#e8945a"]
+COLORS = TEAL_COLORS
 
 DISPLAY_NAMES = {
     "Held-out": "Held-Out",
@@ -154,58 +174,90 @@ def build_groups(meta, npz, layer, phase="discussion", avg_rounds=True):
     return {rid: g for rid, g in groups.items() if len(g["agents"]) == 4}
 
 
+# ── MHA probe ────────────────────────────────────────────────────────────
+
+class MultiHeadAttentionProbe(nn.Module):
+    """Multi-headed self-attention probe over the 4-agent group.
+
+    Input:  (batch, 4, input_dim) — one activation vector per agent
+    Output: (batch, 4)            — per-agent deception logits
+    """
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.proj_in  = nn.Linear(input_dim, MHA_D_MODEL)
+        self.attn     = nn.MultiheadAttention(MHA_D_MODEL, MHA_NUM_HEADS,
+                                              dropout=MHA_DROPOUT, batch_first=True)
+        self.norm     = nn.LayerNorm(MHA_D_MODEL)
+        self.proj_out = nn.Linear(MHA_D_MODEL, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.proj_in(x)                      # (B, 4, d_model)
+        attended, _ = self.attn(h, h, h)
+        h = self.norm(h + attended)              # residual + norm
+        return self.proj_out(h).squeeze(-1)      # (B, 4) logits
+
+
 # ── Probe training ───────────────────────────────────────────────────────
 
-def train_deception_probe(meta, npz, layer, phase="discussion", exclude_domain=None):
-    """Train the deception direction from raw per-sample activations.
+def train_deception_probe(meta, npz, layer, phase="discussion", exclude_domain=None, seed=0):
+    """Train an MHA deception probe from group-level activations.
 
-    Filters to collusion runs, public channel, and the specified phase.
-    Excludes failed coordination scenarios from the colluder class.
-    If exclude_domain is set, samples from that domain are excluded
-    (used for leave-domain-out CV).
+    Builds groups from meta/npz, then trains a MultiHeadAttentionProbe where
+    colluder agents in collusion runs are labeled 1, honest agents 0, and all
+    agents in control runs are labeled 0. 
 
-    Returns (scaler, deception_direction).
+    Returns (scaler, probe).
     """
-    n = len(meta)
-    acts = get_layer(npz, n, layer)
+    torch.manual_seed(seed)
+    groups = build_groups(meta, npz, layer, phase=phase,
+                          avg_rounds=(phase == "discussion"))
 
-    col_idx, hon_idx = [], []
-    for i, m in enumerate(meta):
-        if m["mode"] != "collusion":
-            continue
-        if m["channel"] != "public":
-            continue
-        if phase == "discussion" and m["phase"] != "discussion":
-            continue
-        _, scenario_id = _parse_run_id(m["run_id"])
+    X_list, y_list = [], []
+    for rid, g in groups.items():
+        _, scenario_id = _parse_run_id(rid)
         if exclude_domain and _domain_from_scenario_id(scenario_id) == exclude_domain:
             continue
-        if m["role"] == "colluder":
-            if scenario_id in config.FAILED_COORDINATION_SCENARIOS:
-                continue
-            col_idx.append(i)
-        elif m["role"] == "honest":
-            hon_idx.append(i)
 
-    nc = min(len(col_idx), len(hon_idx))
-    rng = np.random.RandomState(42)
-    hon_idx = list(rng.choice(hon_idx, nc, replace=False))
-    col_idx = col_idx[:nc]
+        names = sorted(g["agents"])
+        vecs = np.array([g["agents"][n] for n in names], dtype=np.float32)  # (4, D)
+        if g["mode"] == "collusion":
+            labels = np.array(
+                [1.0 if g["roles"][n] == "colluder" else 0.0 for n in names],
+                dtype=np.float32)
+        else:
+            labels = np.zeros(4, dtype=np.float32)
+
+        X_list.append(vecs)
+        y_list.append(labels)
 
     scaler = StandardScaler()
-    X = scaler.fit_transform(np.vstack([acts[hon_idx], acts[col_idx]]))
-    y = np.array([0] * nc + [1] * nc)
+    scaler.fit(np.vstack(X_list))
+    X_scaled = np.array([scaler.transform(x) for x in X_list], dtype=np.float32)  # (N, 4, D)
+    y = np.array(y_list, dtype=np.float32)                                         # (N, 4)
 
-    probe = LogisticRegression(max_iter=1000, C=1.0, random_state=42)
-    probe.fit(X, y)
-    w = probe.coef_[0]
-    w = w / np.linalg.norm(w)
-    return scaler, w
+    probe = MultiHeadAttentionProbe(input_dim=X_scaled.shape[2])
+    optimizer = torch.optim.Adam(probe.parameters(), lr=MHA_LR)
+    criterion = nn.BCEWithLogitsLoss()
+    X_t = torch.from_numpy(X_scaled)
+    y_t = torch.from_numpy(y)
+    n = len(X_t)
+
+    probe.train()
+    for _ in range(MHA_EPOCHS):
+        perm = torch.randperm(n)
+        for i in range(0, n, MHA_BATCH_SIZE):
+            idx = perm[i:i + MHA_BATCH_SIZE]
+            loss = criterion(probe(X_t[idx]), y_t[idx])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+    probe.eval()
+    return scaler, probe
 
 
 # ── Score computation ────────────────────────────────────────────────────
 
-def compute_scores(groups, rids, scaler, w):
+def compute_scores(groups, rids, scaler, probe):
     """Compute all five method scores for each run.
 
     Methods:
@@ -222,10 +274,12 @@ def compute_scores(groups, rids, scaler, w):
         g = groups[r]
         names = sorted(g["agents"])
         raw_vecs = [g["agents"][n] for n in names]
-        scaled_vecs = [scaler.transform(v.reshape(1, -1))[0] for v in raw_vecs]
+        scaled_vecs = scaler.transform(np.array(raw_vecs, dtype=np.float32))  # (4, D)
 
-        # Project onto deception direction
-        projs = np.array([w @ v for v in scaled_vecs])
+        # Per-agent deception probabilities via MHA probe
+        with torch.no_grad():
+            x = torch.from_numpy(scaled_vecs).unsqueeze(0)  # (1, 4, D)
+            projs = torch.sigmoid(probe(x)).squeeze(0).numpy()  # (4,)
         order = np.argsort(projs)[::-1]
         projs_sorted = projs[order]
 
@@ -263,22 +317,73 @@ def compute_scores(groups, rids, scaler, w):
 
 # ── Evaluation ───────────────────────────────────────────────────────────
 
+class _MHAClassifier(nn.Module):
+    """MHA classifier for run-level binary classification.
+
+    Treats each feature dimension as a token of size 1, projects to MHA_D_MODEL,
+    applies self-attention, mean-pools, and outputs a single logit per run.
+
+    Input:  (batch, seq_len, 1)
+    Output: (batch,) logits
+    """
+    def __init__(self, seq_len: int):
+        super().__init__()
+        self.proj_in  = nn.Linear(1, MHA_D_MODEL)
+        self.attn     = nn.MultiheadAttention(MHA_D_MODEL, MHA_NUM_HEADS,
+                                              dropout=MHA_DROPOUT, batch_first=True)
+        self.norm     = nn.LayerNorm(MHA_D_MODEL)
+        self.proj_out = nn.Linear(MHA_D_MODEL, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.proj_in(x)                  # (B, seq_len, d_model)
+        attended, _ = self.attn(h, h, h)
+        h = self.norm(h + attended)
+        return self.proj_out(h.mean(dim=1)).squeeze(-1)  # (B,) logits
+
+
+def _fit_mha_classifier(X: np.ndarray, y: np.ndarray) -> _MHAClassifier:
+    """Train an _MHAClassifier on (N, features) data with binary labels."""
+    X_t = torch.tensor(X[:, :, None], dtype=torch.float32)  # (N, features, 1)
+    y_t = torch.tensor(y, dtype=torch.float32)
+    clf = _MHAClassifier(seq_len=X.shape[1])
+    optimizer = torch.optim.Adam(clf.parameters(), lr=MHA_LR)
+    criterion = nn.BCEWithLogitsLoss()
+    n = len(X_t)
+    clf.train()
+    for _ in range(MHA_EPOCHS):
+        perm = torch.randperm(n)
+        for i in range(0, n, MHA_BATCH_SIZE):
+            idx = perm[i:i + MHA_BATCH_SIZE]
+            loss = criterion(clf(X_t[idx]), y_t[idx])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+    clf.eval()
+    return clf
+
+
+def _mha_predict_proba(clf: _MHAClassifier, X: np.ndarray) -> np.ndarray:
+    """Return sigmoid probabilities from an _MHAClassifier for input (N, features)."""
+    with torch.no_grad():
+        x = torch.tensor(X[:, :, None], dtype=torch.float32)
+        return torch.sigmoid(clf(x)).numpy()
+
+
 def _train_asymmetry_classifier(tr_scores, tr_y):
-    """Train Asymmetry Probe classifier on training scores."""
+    """Train MHA Asymmetry Probe classifier on training scores."""
     fs = StandardScaler()
-    clf = LogisticRegression(max_iter=2000, C=0.01, random_state=42)
-    clf.fit(fs.fit_transform(tr_scores["asymmetry_probe"]), tr_y)
+    X = fs.fit_transform(tr_scores["asymmetry_probe"])
+    clf = _fit_mha_classifier(X, tr_y)
     return fs, clf
 
 
 def _train_concat_classifier(tr_scores, tr_y):
-    """Train Sorted Concatenation classifier (PCA + LogReg) on training scores."""
+    """Train Sorted Concatenation classifier (PCA + MHA) on training scores."""
     n_comp = min(50, len(tr_y) - 1, tr_scores["sorted_concat"].shape[1])
     pca = PCA(n_components=n_comp, random_state=42)
     fs = StandardScaler()
     X_tr = fs.fit_transform(pca.fit_transform(tr_scores["sorted_concat"]))
-    clf = LogisticRegression(max_iter=2000, C=0.01, random_state=42)
-    clf.fit(X_tr, tr_y)
+    clf = _fit_mha_classifier(X_tr, tr_y)
     return pca, fs, clf
 
 
@@ -296,20 +401,20 @@ def evaluate(tr_scores, tr_y, te_scores, te_y):
     # Asymmetry Probe
     fs, clf = _train_asymmetry_classifier(tr_scores, tr_y)
     results["asymmetry_probe"] = roc_auc_score(
-        te_y, clf.predict_proba(fs.transform(te_scores["asymmetry_probe"]))[:, 1])
+        te_y, _mha_predict_proba(clf, fs.transform(te_scores["asymmetry_probe"])))
 
     # Sorted Concatenation
     pca, fs2, clf2 = _train_concat_classifier(tr_scores, tr_y)
     X_te = fs2.transform(pca.transform(te_scores["sorted_concat"]))
     results["sorted_concat"] = roc_auc_score(
-        te_y, clf2.predict_proba(X_te)[:, 1])
+        te_y, _mha_predict_proba(clf2, X_te))
 
     return results
 
 
 # ── Leave-domain-out CV ──────────────────────────────────────────────────
 
-def held_out_cv_layer(core_meta, core_npz, layer):
+def held_out_cv_layer(core_meta, core_npz, layer, seed=0):
     """Leave-domain-out cross-validation on Core for one layer."""
     groups = build_groups(core_meta, core_npz, layer, phase="discussion", avg_rounds=True)
     rids = sorted(groups.keys())
@@ -326,9 +431,9 @@ def held_out_cv_layer(core_meta, core_npz, layer):
         if len(np.unique(te_y)) < 2 or len(np.unique(tr_y)) < 2:
             continue
 
-        scaler, w = train_deception_probe(core_meta, core_npz, layer, exclude_domain=hold_dom)
-        tr_scores = compute_scores(groups, tr_rids, scaler, w)
-        te_scores = compute_scores(groups, te_rids, scaler, w)
+        scaler, probe = train_deception_probe(core_meta, core_npz, layer, exclude_domain=hold_dom, seed=seed)
+        tr_scores = compute_scores(groups, tr_rids, scaler, probe)
+        te_scores = compute_scores(groups, te_rids, scaler, probe)
 
         result = evaluate(tr_scores, tr_y, te_scores, te_y)
         if result:
@@ -341,7 +446,7 @@ def held_out_cv_layer(core_meta, core_npz, layer):
 # ── Main computation ─────────────────────────────────────────────────────
 
 def compute_all_results(core_meta, core_npz, transfer_meta, transfer_npz,
-                        stego_meta, stego_npz):
+                        stego_meta, stego_npz, seed=0):
     """Compute AUROC for all methods, groups, and layers."""
 
     # Discover transfer scenario types
@@ -359,17 +464,17 @@ def compute_all_results(core_meta, core_npz, transfer_meta, transfer_npz,
         print(f"  Layer {layer}...")
 
         # -- Core: leave-domain-out CV --
-        cv = held_out_cv_layer(core_meta, core_npz, layer)
+        cv = held_out_cv_layer(core_meta, core_npz, layer, seed=seed)
         for m in METHOD_KEYS:
             results["Held-out"][m].append(cv[m])
 
         # -- Train global probe on all Core data --
-        scaler, w = train_deception_probe(core_meta, core_npz, layer)
+        scaler, probe = train_deception_probe(core_meta, core_npz, layer, seed=seed)
         core_groups = build_groups(core_meta, core_npz, layer,
                                    phase="discussion", avg_rounds=True)
         core_rids = sorted(core_groups.keys())
         core_y = _run_labels(core_groups, core_rids)
-        core_scores = compute_scores(core_groups, core_rids, scaler, w)
+        core_scores = compute_scores(core_groups, core_rids, scaler, probe)
 
         # Train classifiers once (reused for Transfer and Stego)
         asym_fs, asym_clf = _train_asymmetry_classifier(core_scores, core_y)
@@ -382,13 +487,13 @@ def compute_all_results(core_meta, core_npz, transfer_meta, transfer_npz,
         transfer_rids = sorted(transfer_groups.keys())
         transfer_y = _run_labels(transfer_groups, transfer_rids)
         transfer_sc = [transfer_groups[r]["scenario"] for r in transfer_rids]
-        transfer_scores = compute_scores(transfer_groups, transfer_rids, scaler, w)
+        transfer_scores = compute_scores(transfer_groups, transfer_rids, scaler, probe)
 
-        asym_proba = asym_clf.predict_proba(
-            asym_fs.transform(transfer_scores["asymmetry_probe"]))[:, 1]
-        concat_proba = concat_clf.predict_proba(
-            concat_fs.transform(
-                concat_pca.transform(transfer_scores["sorted_concat"])))[:, 1]
+        asym_proba = _mha_predict_proba(
+            asym_clf, asym_fs.transform(transfer_scores["asymmetry_probe"]))
+        concat_proba = _mha_predict_proba(
+            concat_clf,
+            concat_fs.transform(concat_pca.transform(transfer_scores["sorted_concat"])))
 
         for sc in transfer_scenarios:
             mask = np.array([s == sc for s in transfer_sc])
@@ -408,38 +513,29 @@ def compute_all_results(core_meta, core_npz, transfer_meta, transfer_npz,
         stego_y = _run_labels(stego_groups, stego_rids)
 
         if len(np.unique(stego_y)) >= 2 and len(stego_rids) >= 4:
-            stego_scores = compute_scores(stego_groups, stego_rids, scaler, w)
+            stego_scores = compute_scores(stego_groups, stego_rids, scaler, probe)
 
             for key in ["peak_suspicion", "deception_split", "activation_alignment"]:
                 results["blackjack"][key].append(
                     roc_auc_score(stego_y, stego_scores[key]))
 
-            stego_asym = asym_clf.predict_proba(
-                asym_fs.transform(stego_scores["asymmetry_probe"]))[:, 1]
+            stego_asym = _mha_predict_proba(
+                asym_clf, asym_fs.transform(stego_scores["asymmetry_probe"]))
             results["blackjack"]["asymmetry_probe"].append(
                 roc_auc_score(stego_y, stego_asym))
 
-            stego_concat = concat_clf.predict_proba(
-                concat_fs.transform(
-                    concat_pca.transform(stego_scores["sorted_concat"])))[:, 1]
+            stego_concat = _mha_predict_proba(
+                concat_clf,
+                concat_fs.transform(concat_pca.transform(stego_scores["sorted_concat"])))
             results["blackjack"]["sorted_concat"].append(
                 roc_auc_score(stego_y, stego_concat))
 
-    # Aggregate across layers
-    means = {g: {} for g in group_names}
-    stds = {g: {} for g in group_names}
-    for g in group_names:
-        for m in METHOD_KEYS:
-            vals = results[g][m]
-            means[g][m] = np.nanmean(vals) if vals else 0.5
-            stds[g][m] = np.nanstd(vals) if vals else 0.0
-
-    return group_names, means, stds
+    return group_names, results
 
 
 # ── Plotting ─────────────────────────────────────────────────────────────
 
-def plot_figure(group_names, means, stds):
+def plot_figure(group_names, means, stds, reference_means=None):
     """Create the grouped bar chart (Figure 2)."""
     plt.rcParams.update({
         "font.family": "sans-serif",
@@ -474,6 +570,16 @@ def plot_figure(group_names, means, stds):
                edgecolor="white", linewidth=0.2,
                yerr=errs, capsize=1.5,
                error_kw={"linewidth": 0.6, "color": "#333333", "capthick": 0.5})
+
+        if reference_means is not None:
+            for j, g in enumerate(group_names):
+                if g in reference_means and method in reference_means[g]:
+                    ref_val = reference_means[g][method]
+                    x = offsets[j]
+                    ax.plot([x - bar_width / 2, x + bar_width / 2],
+                            [ref_val, ref_val],
+                            color="black", linewidth=1.0, zorder=3,
+                            solid_capstyle="butt")
 
     ax.axhline(0.5, color="grey", linestyle="--", linewidth=0.6, alpha=0.5, zorder=0)
     ax.set_ylim(0.0, 1.08)
@@ -512,46 +618,110 @@ def _draw_bracket(ax, x_left, x_right, label, y_data=-0.17):
 
 # ── Entry point ──────────────────────────────────────────────────────────
 
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--model", default=config.DEFAULT_MODEL,
+                   help=f"HuggingFace model ID (default: {config.DEFAULT_MODEL}).")
+    p.add_argument("--layers", default=None,
+                   help="Probe-layer range, e.g. '26-30' or '26,28,30'. "
+                        "Defaults to config.MODEL_LAYERS for known models.")
+    return p.parse_args()
+
+
 def main():
-    print("Loading data...")
+    global DATA_DIR, CORE_DIR, TRANSFER_DIR, STEGO_DIR, LAYERS
+    args = parse_args()
+
+    short = config.model_short_name(args.model)
+    DATA_DIR = config.activations_dir(short)
+    CORE_DIR = DATA_DIR / "core"
+    TRANSFER_DIR = DATA_DIR / "transfer"
+    STEGO_DIR = DATA_DIR / "stego"
+    LAYERS = (config.parse_layer_range(args.layers) if args.layers
+              else config.default_layers(args.model))
+
+    print(f"Model: {args.model}  (short: {short})")
+    print(f"Activations dir: {DATA_DIR}")
+    print(f"Layers: {LAYERS}")
+
+    print("\nLoading data...")
     core_meta, core_npz = load_data(CORE_DIR)
     transfer_meta, transfer_npz = load_data(TRANSFER_DIR)
     stego_meta, stego_npz = load_data(STEGO_DIR)
     print(f"  Core: {len(core_meta)} samples | Transfer: {len(transfer_meta)} | Stego: {len(stego_meta)}")
 
-    # Null probe sanity check (paper Section 3.2): train on random 50/50 split
-    # of honest agents only — should score near chance.
+    # Null probe sanity check: train MHA probe with randomly shuffled per-agent
+    # colluder labels — should score near chance.
     print("\nNull probe sanity check...")
     null_aucs = []
+    rng = np.random.RandomState(42)
     for layer in LAYERS:
         groups = build_groups(core_meta, core_npz, layer, phase="discussion", avg_rounds=True)
         rids = sorted(groups.keys())
-        # Collect honest-only activations from collusion runs
-        n = len(core_meta)
-        acts = get_layer(core_npz, n, layer)
-        hon_idx = [i for i, m in enumerate(core_meta)
-                   if m["mode"] == "collusion" and m["channel"] == "public"
-                   and m["phase"] == "discussion" and m["role"] == "honest"]
-        rng = np.random.RandomState(42)
-        rng.shuffle(hon_idx)
-        half = len(hon_idx) // 2
+
+        X_list, y_list = [], []
+        for rid in rids:
+            g = groups[rid]
+            if g["mode"] != "collusion":
+                continue
+            names = sorted(g["agents"])
+            vecs = np.array([g["agents"][n] for n in names], dtype=np.float32)
+            labels = np.zeros(4, dtype=np.float32)
+            labels[rng.choice(4, 2, replace=False)] = 1.0  # random 50/50
+            X_list.append(vecs)
+            y_list.append(labels)
+
         scaler = StandardScaler()
-        X = scaler.fit_transform(acts[hon_idx[:half * 2]])
-        y = np.array([0] * half + [1] * half)
-        null_probe = LogisticRegression(max_iter=1000, C=1.0, random_state=42)
-        null_probe.fit(X, y)
-        w_null = null_probe.coef_[0]
-        w_null = w_null / np.linalg.norm(w_null)
-        # Score all runs
-        null_scores = compute_scores(groups, rids, scaler, w_null)
+        scaler.fit(np.vstack(X_list))
+        X_scaled = np.array([scaler.transform(x) for x in X_list], dtype=np.float32)
+        y_arr = np.array(y_list, dtype=np.float32)
+
+        null_probe = MultiHeadAttentionProbe(input_dim=X_scaled.shape[2])
+        optimizer = torch.optim.Adam(null_probe.parameters(), lr=MHA_LR)
+        criterion = nn.BCEWithLogitsLoss()
+        X_t = torch.from_numpy(X_scaled)
+        y_t = torch.from_numpy(y_arr)
+        null_probe.train()
+        for _ in range(MHA_EPOCHS):
+            perm = torch.randperm(len(X_t))
+            for i in range(0, len(X_t), MHA_BATCH_SIZE):
+                idx = perm[i:i + MHA_BATCH_SIZE]
+                loss = criterion(null_probe(X_t[idx]), y_t[idx])
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        null_probe.eval()
+
+        null_scores = compute_scores(groups, rids, scaler, null_probe)
         run_y = _run_labels(groups, rids)
         if len(np.unique(run_y)) >= 2:
             null_aucs.append(roc_auc_score(run_y, null_scores["peak_suspicion"]))
     print(f"  Null probe AUROC (mean across layers): {np.mean(null_aucs):.2f}")
 
-    print(f"\nComputing results ({len(LAYERS)} layers)...")
-    group_names, means, stds = compute_all_results(
-        core_meta, core_npz, transfer_meta, transfer_npz, stego_meta, stego_npz)
+    print(f"\nComputing results ({len(LAYERS)} layers, {N_SEEDS} seeds)...")
+    all_raw = []
+    group_names = None
+    for seed in range(N_SEEDS):
+        print(f"  Seed {seed}...")
+        gn, raw = compute_all_results(
+            core_meta, core_npz, transfer_meta, transfer_npz, stego_meta, stego_npz,
+            seed=seed)
+        if group_names is None:
+            group_names = gn
+        all_raw.append(raw)
+
+    # Collect all AUROC scores across seeds and layers before aggregating
+    final_means = {g: {} for g in group_names}
+    final_stds  = {g: {} for g in group_names}
+    for g in group_names:
+        for m in METHOD_KEYS:
+            all_vals = []
+            for raw in all_raw:
+                all_vals.extend(raw[g][m])
+            arr = np.array(all_vals, dtype=float)
+            n = np.sum(~np.isnan(arr))
+            final_means[g][m] = np.nanmean(arr) if n > 0 else 0.5
+            final_stds[g][m]  = np.nanstd(arr) / np.sqrt(n) if n > 0 else 0.0
 
     # Print table
     header = f"{'Group':>20}" + "".join(
@@ -560,16 +730,60 @@ def main():
     print("-" * len(header))
     for g in group_names:
         row = f"{DISPLAY_NAMES.get(g, g).replace(chr(10), ' '):>20}"
-        row += "".join(f"  {means[g][m]:>10.3f}+/-{stds[g][m]:.3f}" for m in METHOD_KEYS)
+        row += "".join(f"  {final_means[g][m]:>10.3f}+/-{final_stds[g][m]:.3f}" for m in METHOD_KEYS)
         print(row)
+
+    assert group_names is not None
+
+    # Load reference lines from a previous run
+    CSV_DIR = config.RESULTS_ROOT / "auroc_scores"
+    CSV_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path = CSV_DIR / f"{OUT_STEM}.csv"
+    reference_means = None
+    if REFERENCE_STEM is not None:
+        ref_path = CSV_DIR / f"{REFERENCE_STEM}.csv"
+        if ref_path.exists():
+            reference_means = {}
+            with open(ref_path, newline="") as ref_f:
+                for row in csv.DictReader(ref_f):
+                    if row["record_type"] == "mean":
+                        g, m = row["group"], row["method"]
+                        if g not in reference_means:
+                            reference_means[g] = {}
+                        reference_means[g][m] = float(row["auroc"])
+            print(f"Loaded reference lines from {ref_path}")
+        else:
+            print(f"Reference CSV not found, skipping reference lines: {ref_path}")
+
+    # Save CSV of AUROC scores
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["record_type", "group", "method", "seed", "layer", "auroc"])
+        for seed_idx, raw in enumerate(all_raw):
+            for g in group_names:
+                for m in METHOD_KEYS:
+                    for layer_idx, layer in enumerate(LAYERS):
+                        val = raw[g][m][layer_idx] if layer_idx < len(raw[g][m]) else float("nan")
+                        writer.writerow(["raw", g, m, seed_idx, layer, val])
+        for g in group_names:
+            for m in METHOD_KEYS:
+                writer.writerow(["mean", g, m, "", "", final_means[g][m]])
+        overall = np.nanmean([
+            final_means[g][m]
+            for g in group_names if g != "Held-out"
+            for m in METHOD_KEYS
+        ])
+        writer.writerow(["overall_mean", "", "", "", "", overall])
+    print(f"Saved CSV to {csv_path}")
+    print(f"Overall mean AUROC (excl. Held-out): {overall:.3f}")
 
     # Save figure
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    fig = plot_figure(group_names, means, stds)
-    fig.savefig(OUT_DIR / "method_comparison.pdf", bbox_inches="tight")
-    fig.savefig(OUT_DIR / "method_comparison.png", dpi=300, bbox_inches="tight")
+    fig = plot_figure(group_names, final_means, final_stds, reference_means=reference_means)
+    #fig.savefig(OUT_DIR / f"{OUT_STEM}.pdf", bbox_inches="tight")
+    fig.savefig(OUT_DIR / f"{OUT_STEM}.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"\nSaved to {OUT_DIR / 'method_comparison.pdf'}")
+    print(f"\nSaved to {OUT_DIR / OUT_STEM}.pdf")
 
 
 if __name__ == "__main__":

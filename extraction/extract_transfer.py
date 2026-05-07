@@ -1,5 +1,5 @@
 """
-Extract hidden-state activations from Qwen3-32B-AWQ for NARCBench-Transfer.
+Extract hidden-state activations for NARCBench-Transfer.
 
 Extracts layers 16-55 (mid-to-late, where deception signal is strongest) at both:
   - input-time:      last token of the prompt before generation
@@ -38,7 +38,7 @@ if not hasattr(_ta, "PytorchGELUTanh"):
             return torch.nn.functional.gelu(x, approximate="tanh")
     _ta.PytorchGELUTanh = _PytorchGELUTanh
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from tqdm import tqdm
 
 CHECKPOINT_EVERY = 100
@@ -46,7 +46,7 @@ DEFAULT_LAYER_RANGE = "16-55"
 
 # Requires raw scenario outputs from generation/transfer.py
 DEFAULT_RUNS_DIR = config.RAW_ROOT / "transfer"
-DEFAULT_OUTPUT_DIR = config.ACTIVATIONS_ROOT / "qwen3_32b" / "transfer"
+DEFAULT_OUTPUT_DIR = None  # derived from --model in main() if --output-dir not given
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +58,20 @@ def _strip_name_prefix(msg: str) -> str:
     return re.sub(r"^\[[^\]]+\]:\s*", "", msg)
 
 
-def load_runs(runs_dir: Path) -> list[dict]:
-    """Load all samples from NARCBench-Transfer run directories."""
+def load_runs(runs_dir: Path, modes: set[str] | None = None) -> list[dict]:
+    """Load all samples from NARCBench-Transfer run directories.
+
+    If `modes` is provided, only include runs whose config['mode'] is in that set.
+    """
     run_dirs = sorted([d for d in runs_dir.iterdir() if d.is_dir()])
-    print(f"Found {len(run_dirs)} run directories in {runs_dir}")
+    if modes:
+        run_dirs = [
+            d for d in run_dirs
+            if json.loads((d / "run_config.json").read_text()).get("mode") in modes
+        ]
+        print(f"Found {len(run_dirs)} run directories in {runs_dir} (modes={sorted(modes)})")
+    else:
+        print(f"Found {len(run_dirs)} run directories in {runs_dir}")
 
     samples = []
     missing = []
@@ -92,7 +102,9 @@ def load_runs(runs_dir: Path) -> list[dict]:
             channel = entry["channel"]
             agent   = entry["agent_name"]
 
-            if phase == "discussion" and channel == "private":
+            if channel == "private":
+                # Private-round messages (phase may be "private" or "discussion"
+                # depending on generator; channel is the stable discriminator).
                 response = private_responses[private_idx] if private_idx < len(private_responses) else ""
                 private_idx += 1
             elif phase == "discussion" and channel == "public":
@@ -106,9 +118,10 @@ def load_runs(runs_dir: Path) -> list[dict]:
             samples.append({
                 # Identification
                 "run_id":           config["run_id"],
+                "seed":             config.get("seed", 0),
                 "scenario_id":      config["scenario_id"],
-                "scenario_domain":  config["scenario_domain"],
-                "scenario_title":   config["scenario_title"],
+                "scenario_domain":  config.get("scenario_domain", config.get("scenario_type", "")),
+                "scenario_title":   config.get("scenario_title", ""),
                 "mode":             config["mode"],
                 # Agent / role
                 "agent_name":       agent,
@@ -152,7 +165,7 @@ def _print_distribution(samples: list[dict]):
 # Model
 # ---------------------------------------------------------------------------
 
-def load_model(model_name: str):
+def load_model(model_name: str, quantise: str | None = None):
     print(f"Loading tokenizer: {model_name}")
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -162,12 +175,60 @@ def load_model(model_name: str):
             model_name, trust_remote_code=True, use_fast=False
         )
 
-    print(f"Loading model: {model_name} (device_map=auto)")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    if quantise == "8bit":
+        print(f"Loading model: {model_name} (8-bit quantisation)")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map="auto", trust_remote_code=True,
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+        )
+        model.eval()
+        print("Model loaded.")
+        return model, tokenizer
+
+    if quantise == "4bit":
+        print(f"Loading model: {model_name} (4-bit quantisation)")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map="auto", trust_remote_code=True,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16),
+        )
+        model.eval()
+        print("Model loaded.")
+        return model, tokenizer
+
+    if "awq" in model_name.lower():
+        # Transformers 5.x dropped direct AWQ support in favour of gptqmodel, so use
+        # AutoAWQ's own loader. It returns a wrapper with .model (the HF module).
+        from awq import AutoAWQForCausalLM
+        print(f"Loading model: {model_name} (AutoAWQ, device_map=auto)")
+        wrapper = AutoAWQForCausalLM.from_quantized(
+            model_name,
+            device_map="auto",
+            fuse_layers=False,
+            trust_remote_code=True,
+        )
+        model = wrapper.model
+    elif "gpt-oss" in model_name.lower():
+        # GPT-OSS loads in MXFP4 native when `kernels` is installed (~12 GB total).
+        # Eager is the only attention impl supported in transformers 5.5 for this
+        # architecture — callers must ensure samples stay under ~4 k tokens.
+        print(f"Loading model: {model_name} (MXFP4 native, eager attention)")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            max_memory={0: "22GiB", 1: "22GiB", "cpu": "64GiB"},
+            trust_remote_code=True,
+        )
+    else:
+        # Generic path: transformers handles FP16/BF16 and any other
+        # quantisation scheme declared in the model's config.json.
+        print(f"Loading model: {model_name} (AutoModelForCausalLM, device_map=auto)")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            trust_remote_code=True,
+        )
     model.eval()
     print("Model loaded.")
     return model, tokenizer
@@ -177,14 +238,25 @@ def load_model(model_name: str):
 # Activation hooks
 # ---------------------------------------------------------------------------
 
+def _get_layers(model):
+    """Return the transformer layer list, handling common architectures."""
+    if hasattr(model.model, "layers"):
+        return model.model.layers
+    # Multimodal / language-model-nested (e.g. Gemma 4)
+    if hasattr(model.model, "language_model") and hasattr(model.model.language_model, "layers"):
+        return model.model.language_model.layers
+    raise AttributeError(f"Cannot find transformer layers in {type(model).__name__}")
+
+
 class ActivationHooks:
     """Capture last-token hidden state at each target layer via forward hooks."""
 
     def __init__(self, model, target_layers: list[int]):
         self.captured: dict[int, torch.Tensor] = {}
         self.hooks = []
+        layers = _get_layers(model)
         for idx in target_layers:
-            hook = model.model.layers[idx].register_forward_hook(self._make_hook(idx))
+            hook = layers[idx].register_forward_hook(self._make_hook(idx))
             self.hooks.append(hook)
 
     def _make_hook(self, idx: int):
@@ -209,6 +281,18 @@ class ActivationHooks:
 # Text builders
 # ---------------------------------------------------------------------------
 
+def _chat_kwargs(tokenizer):
+    """Return chat-template kwargs that suppress thinking traces for Qwen3.
+
+    Other tokenisers reject this kwarg, so apply only when the template
+    actually understands it.
+    """
+    name = (getattr(tokenizer, "name_or_path", "") or "").lower()
+    if "qwen3" in name:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {}
+
+
 def _build_input_text(tokenizer, sample: dict) -> str:
     """Prompt only, with generation prompt appended (input-time)."""
     messages = [
@@ -217,7 +301,7 @@ def _build_input_text(tokenizer, sample: dict) -> str:
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
-        chat_template_kwargs={"enable_thinking": False},
+        **_chat_kwargs(tokenizer),
     )
 
 
@@ -230,7 +314,7 @@ def _build_gen_text(tokenizer, sample: dict) -> str:
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False,
-        chat_template_kwargs={"enable_thinking": False},
+        **_chat_kwargs(tokenizer),
     )
 
 
@@ -295,6 +379,7 @@ def extract_activations(
 
             metadata.append({
                 "run_id":           sample["run_id"],
+                "seed":             sample["seed"],
                 "scenario_id":      sample["scenario_id"],
                 "scenario_domain":  sample["scenario_domain"],
                 "mode":             sample["mode"],
@@ -367,23 +452,34 @@ def save_results(activation_arrays, metadata, output_dir: Path, suffix: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract mid-layer activations from Qwen3-32B-AWQ (NARCBench-Transfer)"
+        description="Extract mid-layer activations for NARCBench-Transfer"
     )
     parser.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR,
                         help="Path to NARCBench-Transfer output directory")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--layers", type=str, default=DEFAULT_LAYER_RANGE,
-                        help="Layer range to extract, e.g. '16-55' or '0-63'")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output directory (default: data/activations/<model_short>/transfer)")
+    parser.add_argument("--layers", type=str, default=None,
+                        help="Layer range to extract, e.g. '16-55' or '26,28,30'. "
+                             "Defaults to config.MODEL_LAYERS for known models, "
+                             "else the middle 5 layers of the architecture.")
     parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,
                         help="HuggingFace model ID (default: config.DEFAULT_MODEL)")
+    parser.add_argument("--quantise", type=str, default=None, choices=["4bit", "8bit"],
+                        help="Quantisation mode (default: none)")
     parser.add_argument("--input-only", action="store_true")
     parser.add_argument("--gen-only",   action="store_true")
+    parser.add_argument("--modes",      type=str, default=None,
+                        help="Comma-separated list of run modes to include "
+                             "(e.g. 'collusion,control' to skip implicit). "
+                             "Default: include all.")
     parser.add_argument("--test",       action="store_true", help="10 samples only")
     args = parser.parse_args()
 
-    # Parse layer range
-    lo, hi = args.layers.split("-")
-    target_layers = list(range(int(lo), int(hi) + 1))
+    if args.output_dir is None:
+        args.output_dir = config.activations_dir(config.model_short_name(args.model)) / "transfer"
+
+    # Defer layer-range default to after model load so we can read num_hidden_layers.
+    target_layers = config.parse_layer_range(args.layers) if args.layers else None
 
     print("=" * 60)
     print("Activation Extraction: NARCBench-Transfer")
@@ -398,7 +494,8 @@ def main():
         print(f"ERROR: runs dir not found: {args.runs_dir}")
         sys.exit(1)
 
-    samples = load_runs(args.runs_dir)
+    modes_filter = set(m.strip() for m in args.modes.split(",")) if args.modes else None
+    samples = load_runs(args.runs_dir, modes=modes_filter)
     if not samples:
         print("ERROR: No samples found.")
         sys.exit(1)
@@ -408,7 +505,13 @@ def main():
         print(f"\nTEST MODE: {len(samples)} samples only")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    model, tokenizer = load_model(args.model)
+    model, tokenizer = load_model(args.model, quantise=args.quantise)
+
+    # If no --layers was given, use config defaults (or middle 5 of the model).
+    if target_layers is None:
+        target_layers = config.default_layers(args.model, model.config.num_hidden_layers)
+    target_layers = [l for l in target_layers if l < model.config.num_hidden_layers]
+    print(f"Extracting layers: {target_layers}")
 
     # Input-time
     if not args.gen_only:

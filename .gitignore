@@ -1,0 +1,16 @@
+# Generated outputs
+data/
+results/
+
+# Python artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

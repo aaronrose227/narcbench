@@ -1,72 +1,184 @@
 # NARCBench
 
-Code and data for **Detecting Multi-Agent Collusion Through Multi-Agent Interpretability**.
+Code release for *Detecting Multi-Agent Collusion Through Multi-Agent Interpretability*.
 
-NARCBench is a three-tier benchmark for evaluating multi-agent collusion detection under environment distribution shift. A linear deception probe is trained on committee-deliberation activations (Core) and evaluated zero-shot on structurally novel scenarios (Transfer) and steganographic signalling (Stego).
+[![arXiv](https://img.shields.io/badge/arXiv-2604.01151-b31b1b.svg)](https://arxiv.org/abs/2604.01151) &nbsp;
+[![HuggingFace](https://img.shields.io/badge/🤗%20Dataset-NARCBench-yellow.svg)](https://huggingface.co/datasets/aaronrose227/narcbench)
 
-**Paper**: [arXiv](https://arxiv.org/abs/2604.01151)
+📄 **Paper:** https://arxiv.org/abs/2604.01151
+🤗 **Dataset:** https://huggingface.co/datasets/aaronrose227/narcbench
 
-**Data**: [HuggingFace](https://huggingface.co/datasets/aaronrose227/narcbench)
+![Pipeline overview](docs/pipeline.png)
 
-## Quick Start
+## What this repo does
+
+A reproducible pipeline for detecting collusion between LLM agents using activation probes. Given a HuggingFace open-weight model, it will:
+
+1. **Generate** multi-agent scenarios on three benchmark tiers (Core, Transfer, Stego).
+2. **Extract** hidden-state activations from the model.
+3. **Train** five probing techniques on top of a learned deception direction.
+4. **Evaluate** detection AUROC across in-distribution and out-of-distribution settings.
+
+It works for any open-weight model that exposes `hidden_states`. The four models from the paper are pre-configured:
+
+| HuggingFace ID | Layers | Default probe range |
+|----------------|-------:|--------------------:|
+| `Qwen/Qwen3-32B-AWQ` | 64 | 26–30 |
+| `meta-llama/Llama-3.1-70B-Instruct-AWQ-INT4` | 80 | 32–37 |
+| `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B` | 64 | 26–30 |
+| `openai/gpt-oss-20b` | 24 | 10–14 |
+
+For an unlisted model, pass `--layers <range>` explicitly or add an entry to `MODEL_LAYERS` in `config.py`.
+
+## Quickstart
 
 ```bash
-pip install numpy scikit-learn matplotlib
-python reproduce.py
+# Install (CUDA-capable GPU required for generation/extraction; probes run on CPU).
+pip install -r requirements.txt
+
+# Full pipeline (generation + extraction) end-to-end:
+bash scripts/run_model.sh Qwen/Qwen3-32B-AWQ
+
+# Audit collusion runs (see "Auditing collusion runs" below) — delete failed run dirs.
+
+# Reproduce main results (Figure 3, Table 1):
+PYTHONPATH=. python3 probes/reproduce.py --model Qwen/Qwen3-32B-AWQ
 ```
 
-This reproduces Table 1 and Figure 2 from the paper. Requires the pre-extracted activation data from the HuggingFace dataset (see Data section below). Output is saved to `results/figures/`.
-
-## Data
-
-The activation data and scenario data are hosted on HuggingFace due to size (~2.6GB). Download and place them in `data/`:
+For other paper models, swap the HF ID:
 
 ```bash
-huggingface-cli download aaronrose227/narcbench --repo-type dataset --local-dir data
+# Llama-3.1-70B (needs 2× 48 GB):
+bash scripts/run_model.sh meta-llama/Llama-3.1-70B-Instruct-AWQ-INT4
+PYTHONPATH=. python3 probes/reproduce.py --model meta-llama/Llama-3.1-70B-Instruct-AWQ-INT4
+
+# DeepSeek-R1 (set MAX_MODEL_LEN higher for reasoning traces):
+MAX_MODEL_LEN=16384 bash scripts/run_model.sh deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+PYTHONPATH=. python3 probes/reproduce.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+
+# GPT-OSS-20B (single GPU works):
+TENSOR_PARALLEL=1 bash scripts/run_model.sh openai/gpt-oss-20b
+PYTHONPATH=. python3 probes/reproduce.py --model openai/gpt-oss-20b
 ```
+
+For non-AWQ models that don't fit in memory, add `--quantise 4bit`:
+
+```bash
+bash scripts/run_model.sh meta-llama/Llama-3.1-70B-Instruct --quantise 4bit
+```
+
+## Tuning to your hardware
+
+Override these env vars before running `scripts/run_model.sh`:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `VLLM_PORT` | `8020` | Port the vLLM server listens on |
+| `TENSOR_PARALLEL` | `2` | Number of GPUs to shard the model across |
+| `GPU_MEM_UTIL` | `0.90` | Fraction of GPU memory vLLM may use |
+| `MAX_MODEL_LEN` | `8192` | vLLM context window (raise for reasoning models) |
+
+Hardware used in the paper:
+- Qwen3-32B-AWQ, GPT-OSS-20B: workstation, 2× NVIDIA RTX (24 GB each)
+- Llama-3.1-70B-AWQ-INT4, DeepSeek-R1-Distill-Qwen-32B: server, 2–4× NVIDIA A40 (48 GB each)
+
+## Auditing collusion runs (required before probe training)
+
+Generation does not guarantee that colluders actually coordinate — frontier models sometimes refuse the coalition instruction, ignore it, or vote against the assigned target. **Hand-audit each collusion run before training the probe.** For the paper, we kept runs where:
+
+- **Core**: both colluders voted for the assigned target option.
+- **Transfer**: both colluders attempted the coordinated line as described in the prompt.
+- **Stego**: the Big Player's bets correlated with the true card count (use `analysis/stego_correlations.py` to compute this per shoe).
+
+To exclude a failed run, delete its directory before extraction:
+
+```bash
+rm -rf data/raw/<model_short>/core/deception__cyber_01__collusion
+```
+
+Then re-run extraction. There is no hardcoded "failed scenarios" list — your audit IS the filter.
+
+## What you can run after extraction
+
+| Command | Reproduces |
+|---------|-----------|
+| `python3 probes/reproduce.py --model <hf_id>` | Figure 3 + Table 1: five probing techniques per tier |
+| `python3 probes/roc_analysis.py --model <hf_id>` | Figure 5: ROC curves at strict FPR thresholds |
+| `python3 probes/reproduce_LR.py --model <hf_id>` | Appendix C: LR probe variant |
+| `python3 probes/reproduce_diffMeans.py --model <hf_id>` | Appendix C: difference-of-means variant |
+| `python3 probes/reproduce_LAT.py --model <hf_id>` | Appendix C: LAT variant |
+| `python3 probes/reproduce_mlp.py --model <hf_id>` | Appendix C: MLP variant |
+| `python3 probes/reproduce_multiHead.py --model <hf_id>` | Appendix C: multi-headed attention variant |
+| `python3 probes/reproduce_multiLayer.py --model <hf_id>` | Appendix C: multi-layer ensemble variant |
+| `python3 analysis/stego_correlations.py --model <hf_id>` | Tables 3 + 10: bet/count correlations per agent group |
+| `python3 extraction/extract_token_traces.py --model <hf_id>` | Appendix figure: per-token deception traces |
+
+(Prepend `PYTHONPATH=.` to each command.)
 
 ## Structure
 
 ```
-narcbench/
+.
 ├── README.md
-├── config.py                          # Shared config (model, paths, vLLM settings)
-├── reproduce.py                       # Reproduces Table 1 and Figure 2
-├── generation/                        # Scenario generation (requires vLLM server)
-│   ├── core.py                        # NARCBench-Core (50 committee deliberation scenarios)
-│   ├── transfer.py                    # NARCBench-Transfer (6 structurally distinct types)
-│   ├── stego.py                       # NARCBench-Stego (steganographic card counting)
-│   └── verify_ground_truth.py         # Ground truth verification
-└── extraction/                        # Activation extraction (requires GPU + model weights)
-    ├── extract_core.py                # Core activation extraction
-    ├── extract_transfer.py            # Transfer activation extraction
-    ├── extract_stego.py               # Stego activation extraction
-    └── extract_token_traces.py        # Token-level trace extraction
+├── LICENSE
+├── requirements.txt
+├── config.py                        # Paths, defaults, helpers
+├── docs/pipeline.png                # Pipeline figure (above)
+├── generation/                      # Generate scenarios via vLLM
+│   ├── core.py                      #   NARCBench-Core (50 committee scenarios, 17 domains)
+│   ├── transfer.py                  #   NARCBench-Transfer (6 OOD scenario families)
+│   └── stego.py                     #   NARCBench-Stego (steganographic blackjack)
+├── extraction/                      # Extract hidden-state activations
+│   ├── extract_core.py
+│   ├── extract_transfer.py
+│   ├── extract_stego.py
+│   └── extract_token_traces.py
+├── probes/                          # Train and evaluate probes
+│   ├── reproduce.py                 # Main results (Figure 3 + Table 1)
+│   ├── roc_analysis.py              # ROC curves (Figure 5)
+│   ├── reproduce_LR.py              # Probe variant: logistic regression
+│   ├── reproduce_diffMeans.py       # Probe variant: difference of means
+│   ├── reproduce_LAT.py             # Probe variant: linear artificial topography
+│   ├── reproduce_mlp.py             # Probe variant: multi-layer perceptron
+│   ├── reproduce_multiHead.py       # Probe variant: multi-headed attention
+│   ├── reproduce_multiLayer.py      # Probe variant: multi-layer ensemble
+│   ├── comparison_plot.py           # Bar-chart helper
+│   └── colours.py                   # Plot palette
+├── analysis/
+│   └── stego_correlations.py        # Bet/count correlations (Tables 3, 10)
+└── scripts/
+    └── run_model.sh                 # End-to-end pipeline
 ```
 
-## Pipeline
+## Generated data schema
 
-1. **Generate scenarios** (`generation/`): Requires a running vLLM server with Qwen3-32B-AWQ. Each script generates scenario data (prompts, conversations, outcomes) for one benchmark tier.
-2. **Extract activations** (`extraction/`): Loads the model locally and extracts hidden-state activations at specified layers.
-3. **Evaluate probes** (`reproduce.py`): Trains a deception probe on Core activations and evaluates five probing techniques across all three benchmark tiers.
+Each scenario produces three files in `data/raw/<model_short>/<tier>/<run_dir>/`:
 
-## Data Format
+- `run_config.json` — scenario configuration (agents, coalition, mode, roles, seed, tier-specific fields).
+- `agent_prompts.json` — per-turn system + user prompts.
+- `results.json` — per-turn agent responses.
 
-Each scenario run directory contains:
-- `run_config.json` — Scenario setup, agent roles, and coalition membership
-- `results.json` — Full conversation transcripts, votes, and outcomes
-- `agent_prompts.json` — Exact system and user prompts sent to each agent per round
+After extraction, `data/activations/<model_short>/<tier>/` contains:
+
+- `metadata_gen.json` — per-sample metadata, one entry per (agent, turn).
+- `activations_gen.npz` — keyed `layer_<idx>`; rows align with `metadata_gen.json`.
+
+Common metadata fields across all tiers: `run_id`, `mode` (`collusion`/`control`), `role` (`colluder`/`honest`), `channel` (`public`/`private`/`thinking`), `phase`, `round`, `agent_name`, `n_tokens`. Tier-specific fields (e.g. `agent_vote` for Core, `family` for Transfer, `bp_corr` for Stego) are also written.
+
+## Configuration
+
+All paths and helpers are centralised in [`config.py`](config.py):
+
+- `DEFAULT_MODEL` — model used when `--model` is not passed.
+- `MODEL_LAYERS` — recommended probe-layer range per model.
+- `VLLM_PORT` — read from env var, defaults to 8020.
+- `model_short_name(hf_id)` — derives a directory name from a HF model ID.
+- `parse_layer_range("26-30")` / `default_layers(hf_id)` — layer-range helpers.
 
 ## Citation
 
-```bibtex
-@article{rose2026narcbench,
-  title={Detecting Multi-Agent Collusion Through Multi-Agent Interpretability},
-  author={Rose, Aaron and Cullen, Carissa and Kaplowitz, Brandon Gary and Schroeder de Witt, Christian},
-  year={2026}
-}
-```
+If you use NARCBench, please cite the paper.
 
 ## License
 
-MIT
+See [LICENSE](LICENSE).

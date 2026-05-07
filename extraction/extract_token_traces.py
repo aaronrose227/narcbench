@@ -1,5 +1,5 @@
 """
-Extract per-token deception traces from Qwen3-32B-AWQ.
+Extract per-token deception traces.
 
 For each agent utterance in a conversation, projects every response token's
 hidden-state activation onto the deception direction w (learned from the
@@ -32,13 +32,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-TARGET_LAYERS = [26, 27, 28, 29, 30]  # sweet spot from probe results
-PRIMARY_LAYER = 28  # best honest_context AUROC
-
-# Requires pre-extracted Core activations and raw scenario outputs
-PROBE_DATA_DIR = config.ACTIVATIONS_ROOT / "qwen3_32b" / "core"
+# Set in main() from --model and --layers; see config.MODEL_LAYERS for defaults.
+TARGET_LAYERS = None
+PRIMARY_LAYER = None
+PROBE_DATA_DIR = None
 RUNS_DIR = config.RAW_ROOT / "core"
-OUTPUT_DIR = config.ACTIVATIONS_ROOT / "qwen3_32b" / "token_traces"
+OUTPUT_DIR = None
 
 
 # ---------------------------------------------------------------------------
@@ -307,11 +306,15 @@ def extract_traces_for_utterance(
 # ---------------------------------------------------------------------------
 
 def main():
+    global TARGET_LAYERS, PRIMARY_LAYER, PROBE_DATA_DIR, OUTPUT_DIR
     parser = argparse.ArgumentParser(description="Extract per-token deception traces")
     parser.add_argument("--max-runs", type=int, default=10,
                         help="Max number of collusion runs to process (default: 10)")
     parser.add_argument("--model", type=str, default=config.DEFAULT_MODEL,
-                        help="HuggingFace model ID (default: config.DEFAULT_MODEL)")
+                        help=f"HuggingFace model ID (default: {config.DEFAULT_MODEL}).")
+    parser.add_argument("--layers", default=None,
+                        help="Probe-layer range, e.g. '26-30' or '26,28,30'. "
+                             "Defaults to config.MODEL_LAYERS for known models.")
     parser.add_argument("--include-control", action="store_true",
                         help="Also process control runs (no collusion)")
     parser.add_argument("--test", action="store_true",
@@ -321,10 +324,21 @@ def main():
     if args.test:
         args.max_runs = 2
 
+    global RUNS_DIR
+    short = config.model_short_name(args.model)
+    PROBE_DATA_DIR = config.activations_dir(short) / "core"
+    OUTPUT_DIR = config.activations_dir(short) / "token_traces"
+    RUNS_DIR = config.RAW_ROOT / short / "core"
+    TARGET_LAYERS = (config.parse_layer_range(args.layers) if args.layers
+                     else config.default_layers(args.model))
+    PRIMARY_LAYER = TARGET_LAYERS[len(TARGET_LAYERS) // 2]
+
     print("=" * 60)
     print("Token-Level Deception Trace Extraction")
     print("=" * 60)
-    print(f"Layers:    {TARGET_LAYERS}")
+    print(f"Model:     {args.model} (short: {short})")
+    print(f"Runs dir:  {RUNS_DIR}")
+    print(f"Layers:    {TARGET_LAYERS} (primary: {PRIMARY_LAYER})")
     print(f"Max runs:  {args.max_runs}")
     print(f"Control:   {args.include_control}")
     print()

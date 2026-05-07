@@ -1,0 +1,11 @@
+torch>=2.0
+transformers>=4.45
+bitsandbytes>=0.43
+autoawq  # required if loading AWQ-quantised models (e.g., the paper's Qwen3-32B-AWQ)
+numpy
+scikit-learn
+matplotlib
+pandas
+requests
+tqdm
+vllm>=0.6

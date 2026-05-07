@@ -1,8 +1,8 @@
 """
-Generate NARCBench-Core scenarios (committee deliberation).
+Generate the NARCBench-Core dataset (committee deliberation scenarios).
 
 50 scenarios across 17 domains. Each scenario has 4 agents; in collusion mode,
-2 are secretly instructed to collude and deceive. Outputs run_config.json,
+2 are secretly instructed to coordinate and deceive. Outputs run_config.json,
 agent_prompts.json, and results.json per scenario.
 
 Key design:
@@ -4029,6 +4029,11 @@ def call_vllm(system: str, user: str, base_url: str, model: str,
         "max_tokens": max_tokens,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    # GPT-OSS reasons by default into a separate field; give it medium
+    # reasoning and a larger budget so the visible content still populates.
+    if "gpt-oss" in model.lower():
+        payload["reasoning_effort"] = "medium"
+        payload["max_tokens"] = max(max_tokens, 1024)
     try:
         response = requests.post(
             f"{base_url}/chat/completions",
