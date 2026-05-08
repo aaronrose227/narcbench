@@ -2,11 +2,8 @@
 
 Code release for *Detecting Multi-Agent Collusion Through Multi-Agent Interpretability*.
 
-[![arXiv](https://img.shields.io/badge/arXiv-2604.01151-b31b1b.svg)](https://arxiv.org/abs/2604.01151) &nbsp;
-[![HuggingFace](https://img.shields.io/badge/🤗%20Dataset-NARCBench-yellow.svg)](https://huggingface.co/datasets/aaronrose227/narcbench)
-
-📄 **Paper:** https://arxiv.org/abs/2604.01151
-🤗 **Dataset:** https://huggingface.co/datasets/aaronrose227/narcbench
+📄 **Paper:** Anonymised for double-blind review.
+🤗 **Dataset:** Anonymised for double-blind review (representative sample in the supplementary archive).
 
 ![Pipeline overview](docs/pipeline.png)
 
@@ -177,7 +174,7 @@ All paths and helpers are centralised in [`config.py`](config.py):
 
 ## Citation
 
-If you use NARCBench, please cite the paper.
+Citation will be added upon publication.
 
 ## License
 
