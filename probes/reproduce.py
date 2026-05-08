@@ -65,9 +65,19 @@ DISPLAY_NAMES = {
 
 def load_data(directory):
     """Load metadata and activations from a dataset directory."""
-    with open(directory / "metadata_gen.json") as f:
+    npz_path = directory / "activations_gen.npz"
+    meta_path = directory / "metadata_gen.json"
+    if not npz_path.exists():
+        raise SystemExit(
+            f"Activations not found at {npz_path}. "
+            f"Either this tier was not extracted for this model, or the dataset "
+            f"release does not include it. Re-extract via "
+            f"`bash scripts/run_model.sh <hf_model_id>` and the probe scripts will "
+            f"pick up the new files automatically."
+        )
+    with open(meta_path) as f:
         meta = json.load(f)
-    return meta, np.load(directory / "activations_gen.npz")
+    return meta, np.load(npz_path)
 
 
 def get_layer(npz, n, layer):
